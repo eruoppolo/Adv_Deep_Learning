@@ -1,14 +1,5 @@
 ## 📦 **Deliverables and Output**
 
-### **Code Deliverables:**
-
-4. **`notebooks/`** directory:
-   - `01_data_exploration.ipynb`: JAFFE dataset analysis
-   - `02_daa_training.ipynb`: DAA experiments and ablations
-   - `03_kernel_pca_analysis.ipynb`: Kernel selection and component analysis
-   - `04_comparative_study.ipynb`: Head-to-head comparisons
-   - `05_results_visualization.ipynb`: Final results and figures
-
 ### **Model/Data Outputs:**
 
 1. **Trained Models:**
