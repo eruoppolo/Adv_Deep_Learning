@@ -1,1 +1,29 @@
+# .gitignore
+
+# Data files
 data/
+*.csv
+*.zip
+*.tar.gz
+
+# Python Virtual Environment
+# Replace torch_env/ with the name of your environment folder (e.g., venv/, env/)
+torch_env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE and editor specific files
+.vscode/
+.idea/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Build artifacts and logs
+/build/
+/dist/
+*.log
+
+*.pth
