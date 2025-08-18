@@ -1,18 +1,5 @@
 ## 📦 **Deliverables and Output**
 
-### **Model/Data Outputs:**
-
-1. **Trained Models:**
-   - `models/daa_best.pth`: Best DAA model checkpoint
-   - `models/kernel_pca_rbf.pkl`: Fitted Kernel PCA models (one per kernel type)
-   - `models/classifiers/`: Trained downstream classifiers
-
-2. **Extracted Features:**
-   - `features/archetypes.npy`: Learned DAA archetypes (7×latent_dim)
-   - `features/eigenfaces.npy`: Top Kernel PCA components
-   - `features/daa_weights.npy`: Archetypal coefficients for all samples
-   - `features/kpca_projections.npy`: Kernel PCA projections
-
 ### **Visualization Outputs:**
 
 1. **Core Visualizations:**
