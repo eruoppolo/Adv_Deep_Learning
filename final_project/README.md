@@ -2,7 +2,7 @@ final_project/
 ├── README.md                    # Project overview and instructions
 ├── requirements.txt             # Dependencies
 ├── data/
-│   └── jaffe/                  # Dataset
+│   └── jaffe/                   # Dataset
 ├── src/
 │   ├── deep_aa_model.py
 │   ├── kernel_pca.py
