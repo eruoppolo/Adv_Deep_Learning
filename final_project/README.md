@@ -1,3 +1,4 @@
+```
 final_project/
 ├── README.md                    # Project overview and instructions
 ├── requirements.txt             # Dependencies
@@ -16,3 +17,4 @@ final_project/
     ├── technical_report.pdf
     ├── executive_summary.pdf
     └── presentation.pptx
+```
