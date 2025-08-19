@@ -365,7 +365,7 @@ def main():
     config = {
         # Model parameters
         'latent_dim': 64,
-        'num_archetypes': 3,
+        'num_archetypes': 7,
         'dropout_rate': 0.05,
         
         # Training parameters
@@ -380,7 +380,7 @@ def main():
         'reconstruction_weight': 1.0,
         'sparsity_weight': 0.1,
         'diversity_weight': 0.5,
-        'orthogonality_weight': 0.3, # was 0.1
+        'orthogonality_weight': 0.15, # was 0.1
         
         # Other parameters
         'early_stopping_patience': 100,
@@ -390,7 +390,7 @@ def main():
         # Data parameters
         'data_path': '../data/resized_jaffe',
         'val_split': 0.2,
-        'augment': True,  # Set to False for now
+        'augment': False,  # Set to False for now
         'num_workers': 4,
         'seed': 342
     }

@@ -13,6 +13,8 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from sklearn.model_selection import GroupKFold
+from torch.utils.data import Subset
 
 
 # Emotion mapping based on JAFFE filename convention
@@ -175,8 +177,7 @@ def get_data_transforms(
     
     return train_transform, val_transform
 
-
-def create_data_loaders(
+def old_create_data_loaders(
     data_path: str,
     batch_size: int = 16,
     val_split: float = 0.2,
@@ -270,6 +271,105 @@ def create_data_loaders(
     
     return train_loader, val_loader, train_subset, val_subset
 
+def create_data_loaders(
+    data_path: str,
+    batch_size: int = 16,
+    val_split_subject_count: int = 2,  # Use 2 subjects for validation (20%)
+    image_size: int = 128,
+    augment: bool = True,
+    num_workers: int = 2,
+    seed: int = 42
+) -> Tuple[DataLoader, DataLoader, Dataset, Dataset]:
+    """
+    Create training and validation data loaders with a subject-independent split.
+    
+    Args:
+        data_path: Path to JAFFE dataset
+        batch_size: Batch size for data loaders
+        val_split_subject_count: Number of subjects to hold out for validation.
+        image_size: Target image size
+        augment: Whether to use data augmentation for training
+        num_workers: Number of workers for data loading
+        seed: Random seed for reproducibility
+        
+    Returns:
+        train_loader, val_loader, train_dataset, val_dataset
+    """
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    # Get transforms
+    train_transform, val_transform = get_data_transforms(
+        image_size=image_size,
+        augment=augment
+    )
+    
+    # --- Start of Major Changes ---
+    
+    # 1. Create a single dataset instance to get file lists and subject groups
+    # We apply the validation transform initially; we will change it for the training subset later.
+    full_dataset = JAFFEDataset(
+        folder_path=data_path,
+        transform=val_transform 
+    )
+    
+    # 2. Get subjects for a grouped split
+    subjects = np.array(full_dataset.subjects)
+    unique_subjects = np.unique(subjects)
+    
+    # Shuffle subjects to ensure a random split each time (if seed changes)
+    np.random.shuffle(unique_subjects)
+    
+    # Split subjects into training and validation groups
+    val_subjects = unique_subjects[:val_split_subject_count]
+    train_subjects = unique_subjects[val_split_subject_count:]
+    
+    print(f"\nSplitting by subject:")
+    print(f"  Training subjects: {list(train_subjects)}")
+    print(f"  Validation subjects: {list(val_subjects)}")
+
+    # 3. Create indices for train and validation sets based on subjects
+    train_indices = [i for i, s in enumerate(subjects) if s in train_subjects]
+    val_indices = [i for i, s in enumerate(subjects) if s in val_subjects]
+
+    # 4. Create Subset for validation (which will use the initial val_transform)
+    val_subset = Subset(full_dataset, val_indices)
+    
+    # 5. Create a new dataset instance FOR TRAINING ONLY with augmentation transforms
+    # This is a clean way to apply different transforms to train/val splits.
+    train_dataset_augmented = JAFFEDataset(
+        folder_path=data_path,
+        transform=train_transform,
+        augment=augment
+    )
+    train_subset = Subset(train_dataset_augmented, train_indices)
+    
+    # --- End of Major Changes ---
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    print(f"\nData split:")
+    print(f"  Training samples: {len(train_subset)}")
+    print(f"  Validation samples: {len(val_subset)}")
+    print(f"  Total samples: {len(full_dataset)}")
+    
+    return train_loader, val_loader, train_subset, val_subset
 
 def visualize_batch(
     data_loader: DataLoader,
@@ -323,7 +423,6 @@ def visualize_batch(
     plt.tight_layout()
     plt.show()
 
-
 def compute_dataset_statistics(data_loader: DataLoader) -> Tuple[float, float]:
     """
     Compute mean and std of the dataset.
@@ -349,7 +448,6 @@ def compute_dataset_statistics(data_loader: DataLoader) -> Tuple[float, float]:
     std /= total_samples
     
     return mean.item(), std.item()
-
 
 def test_data_loading():
     """Test data loading functionality."""

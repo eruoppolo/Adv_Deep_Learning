@@ -70,7 +70,7 @@ class ArchetypeAnalyzer:
             input_channels=1,
             input_size=128,
             latent_dim=64,  # Should match training config
-            num_archetypes=3,
+            num_archetypes=7,
             dropout_rate=0.05
         )
 
