@@ -97,7 +97,66 @@ class DAATrainer:
         else:
             raise ValueError(f"Unknown optimizer: {optimizer_type}")
     
-    def train_epoch(self) -> Dict[str, float]:
+    def train_epoch(self, current_epoch: int) -> Dict[str, float]:
+        """Train for one epoch."""
+        self.model.train()
+        epoch_losses = {
+            'total': 0.0,
+            'reconstruction': 0.0,
+            'sparsity': 0.0,
+            'diversity': 0.0,
+            'orthogonality': 0.0,
+            'spread': 0.0
+        }
+        num_batches = 0
+        
+        pbar = tqdm(self.train_loader, desc="Training", leave=False)
+
+        for batch_idx, (images, labels) in enumerate(pbar):
+            images = images.to(self.device)
+            
+            # Forward pass - 4 outputs
+            reconstructed, alpha, z, features = self.model(images)
+            
+            # Compute loss
+            loss, loss_dict = self.criterion(reconstructed,
+                                              images, alpha, self.model,
+                                              current_epoch=current_epoch,
+                                              warmup_epochs=self.config.get('warmup_epochs', 25))
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping
+            if self.config.get('gradient_clip', 0) > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config['gradient_clip']
+                )
+            
+            self.optimizer.step()
+            
+            # Update running losses
+            for key in epoch_losses:
+                if key in loss_dict:
+                    epoch_losses[key] += loss_dict[key]
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'recon': f"{loss_dict['reconstruction']:.4f}",
+                'sparse': f"{loss_dict['sparsity']:.4f}"
+            })
+        
+        # Average losses
+        for key in epoch_losses:
+            epoch_losses[key] /= num_batches
+        
+        return epoch_losses
+    
+    def train_epoch_old(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
         epoch_losses = {
@@ -289,7 +348,8 @@ class DAATrainer:
             print("-" * 30)
             
             # Training
-            train_losses = self.train_epoch()
+            train_losses = self.train_epoch(current_epoch=epoch)
+            # train_losses = self.train_epoch()
             
             # Validation
             val_losses = self.validate()
@@ -364,23 +424,24 @@ def main():
     # Configuration
     config = {
         # Model parameters
-        'latent_dim': 64,
-        'num_archetypes': 7,
+        'latent_dim': 16,
+        'num_archetypes': 4,
         'dropout_rate': 0.05,
         
         # Training parameters
-        'batch_size': 16,
-        'num_epochs': 200,  # Start with 200
-        'learning_rate': 4e-5,
+        'batch_size': 8,
+        'num_epochs': 200,
+        'warmup_epochs': 25, # New parameter
+        'learning_rate': 2e-4,
         'weight_decay': 1e-6,
         'optimizer': 'adamw',
         'gradient_clip': 1.0,
         
         # Loss weights
-        'reconstruction_weight': 1.0,
-        'sparsity_weight': 0.1,
-        'diversity_weight': 0.5,
-        'orthogonality_weight': 0.15, # was 0.1
+        'reconstruction_weight': 8.0,
+        'sparsity_weight': 0.75,
+        'diversity_weight': 0.75,
+        'orthogonality_weight': 0.2,
         
         # Other parameters
         'early_stopping_patience': 100,
@@ -389,9 +450,9 @@ def main():
         
         # Data parameters
         'data_path': '../data/resized_jaffe',
-        'val_split': 0.2,
+        'val_split_subject_count': 2,
         'augment': False,  # Set to False for now
-        'num_workers': 4,
+        'num_workers': 2,
         'seed': 342
     }
     
@@ -407,7 +468,7 @@ def main():
     train_loader, val_loader, _, _ = create_data_loaders(
         data_path=config['data_path'],
         batch_size=config['batch_size'],
-        val_split=config['val_split'],
+        val_split_subject_count=config['val_split_subject_count'],
         augment=config['augment'],
         num_workers=config['num_workers'],
         seed=config['seed']

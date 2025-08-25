@@ -50,10 +50,10 @@ class ArchetypeAnalyzer:
         # Create data loader
         _, self.val_loader, _, _ = create_data_loaders(
             data_path=data_path,
-            batch_size=16,
-            val_split=0.2,
+            batch_size=8,
+            val_split_subject_count=2,
             augment=False,
-            seed=42
+            seed=342
         )
         
         print(f"✅ Loaded model from {model_path}")
@@ -69,8 +69,8 @@ class ArchetypeAnalyzer:
         model = DeepAA(
             input_channels=1,
             input_size=128,
-            latent_dim=64,  # Should match training config
-            num_archetypes=7,
+            latent_dim=16,  # Should match training config
+            num_archetypes=4,
             dropout_rate=0.05
         )
 

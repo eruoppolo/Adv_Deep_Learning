@@ -10,7 +10,14 @@ import numpy as np
 from typing import Tuple, Optional
 
 
-
+def linear_annealing(start_val, end_val, start_epoch, end_epoch, current_epoch):
+    if current_epoch < start_epoch:
+        return start_val
+    if current_epoch >= end_epoch:
+        return end_val
+    return start_val + (end_val - start_val) * (
+        (current_epoch - start_epoch) / (end_epoch - start_epoch)
+    )
 
 class DeepAA(nn.Module):
     """
@@ -36,9 +43,9 @@ class DeepAA(nn.Module):
         self.num_archetypes = num_archetypes
         
         if encoder_channels is None:
-            encoder_channels = [32, 64, 128, 256]
+            encoder_channels = [32, 64, 128, 256, 512]
         if decoder_channels is None:
-            decoder_channels = [256, 128, 64, 32]
+            decoder_channels = [512, 256, 128, 64, 32]
             
         self.encoded_size = input_size // (2 ** len(encoder_channels))
         self.encoder_output_dim = encoder_channels[-1] * self.encoded_size * self.encoded_size
@@ -111,6 +118,35 @@ class DeepAA(nn.Module):
         
         return nn.Sequential(*layers)
     
+    def _old_build_decoder(self, channels, dropout_rate, use_batch_norm):
+        # --- OLD CODE ---
+        # layers = [nn.Unflatten(1, (channels[0], self.encoded_size, self.encoded_size))]
+        # for i in range(len(channels) - 1):
+        #     layers.append(nn.ConvTranspose2d(channels[i], channels[i+1], 3, stride=2, padding=1, output_padding=1))
+        #     # ...
+        # layers.append(nn.ConvTranspose2d(channels[-1], self.input_channels, 3, stride=2, padding=1, output_padding=1))
+        # layers.append(nn.Tanh())
+        
+        # --- NEW CODE ---
+        layers = [nn.Unflatten(1, (channels[0], self.encoded_size, self.encoded_size))]
+        
+        in_channels = channels[0]
+        for out_channels in channels[1:]:
+            layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+            layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            if use_batch_norm:
+                layers.append(nn.BatchNorm2d(out_channels))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout2d(dropout_rate))
+            in_channels = out_channels
+        
+        # Final layer to get to image size and channels
+        layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+        layers.append(nn.Conv2d(in_channels, self.input_channels, kernel_size=3, padding=1))
+        layers.append(nn.Tanh())
+        
+        return nn.Sequential(*layers)
+    
     def encode(self, x):
         h = self.encoder_cnn(x)
         h = h.view(h.size(0), -1)
@@ -166,13 +202,15 @@ class DAALoss(nn.Module):
         self.orthogonality_weight = orthogonality_weight
         self.mse_loss = nn.MSELoss()
         
-    def forward(self, reconstructed, original, alpha, model):
+    # def forward(self, reconstructed, original, alpha, model):
+    def forward(self, reconstructed, original, alpha, model, current_epoch: int = -1, warmup_epochs: int = 20):
         # 1. Reconstruction loss
         recon_loss = self.mse_loss(reconstructed, original)
         
         # 2. Sparsity loss - L2 norm
-        sparsity_loss = -torch.mean(torch.sum(alpha ** 2, dim=1))
-        
+        old_sparsity_loss = -torch.mean(torch.sum(alpha ** 2, dim=1))
+        sparsity_loss = torch.mean(torch.sum(alpha * torch.log(alpha + 1e-8), dim=1))  # KL divergence
+
         # 3. Diversity loss
         mean_usage = torch.mean(alpha, dim=0)
         uniform_target = 1.0 / model.num_archetypes
@@ -189,18 +227,35 @@ class DAALoss(nn.Module):
         archetype_distances = torch.pdist(model.archetypes, p=2)
         min_distance = torch.min(archetype_distances) if len(archetype_distances) > 0 else torch.tensor(0.0)
         spread_loss = -min_distance
-        
+
+        # If current_epoch is not passed, use full weights (for inference/testing)
+        if current_epoch == -1:
+            reg_weight = 1.0
+        else:
+            # Linearly increase regularization weight from 0.0 to 1.0 over `warmup_epochs`
+            reg_weight = linear_annealing(0.0, 1.0, 0, warmup_epochs, current_epoch)
+
         # Combine losses
-        total_loss = (
+        total_los_old = (
             self.reconstruction_weight * recon_loss +
             self.sparsity_weight * sparsity_loss +
             self.diversity_weight * diversity_loss +
             self.orthogonality_weight * orthogonality_loss +
-            0.1 * spread_loss
+            0.05 * spread_loss
+        )
+
+        total_loss = (
+            self.reconstruction_weight * recon_loss +
+            reg_weight * (
+                self.sparsity_weight * sparsity_loss +
+                self.diversity_weight * diversity_loss +
+                self.orthogonality_weight * orthogonality_loss +
+                0.05 * spread_loss
+            )
         )
         
         # Create loss dictionary
-        loss_dict = {
+        loss_dict_old = {
             'reconstruction': recon_loss.item(),
             'sparsity': sparsity_loss.item(),
             'diversity': diversity_loss.item(),
@@ -208,6 +263,19 @@ class DAALoss(nn.Module):
             'spread': spread_loss.item(),
             'total': total_loss.item()
         }
+
+        loss_dict = {
+            'reconstruction': recon_loss.item(),
+            'sparsity': sparsity_loss.item(),
+            'diversity': diversity_loss.item(),
+            'orthogonality': orthogonality_loss.item(),
+            'spread': spread_loss.item(),
+            'total': total_loss.item(),
+            'reg_weight': reg_weight
+
+        }
+
+
         
         return total_loss, loss_dict
 
@@ -254,6 +322,7 @@ def test_model():
     print("\n✅ Model test passed!")
     
     return model
+
 
 
 if __name__ == "__main__":
