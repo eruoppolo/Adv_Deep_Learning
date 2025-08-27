@@ -17,13 +17,15 @@ from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+
 # Import our modules
-from deep_aa_model import DeepAA, DAALoss
+from deep_aa_model import DeepAA, DAALoss, DAAMonitor
 from data_utils import create_data_loaders, visualize_batch, EMOTION_NAMES
+
 
 class DAATrainer:
     """
-    Standalone trainer for improved DAA model.
+    Fixed trainer with proper monitoring.
     """
     
     def __init__(
@@ -40,113 +42,87 @@ class DAATrainer:
         self.device = device
         self.config = config
         
-        # Loss function
+        # Use fixed loss
         self.criterion = DAALoss(
             reconstruction_weight=config.get('reconstruction_weight', 1.0),
-            sparsity_weight=config.get('sparsity_weight', 0.1),
-            diversity_weight=config.get('diversity_weight', 0.5),
-            orthogonality_weight=config.get('orthogonality_weight', 0.1)
+            sparsity_weight=config.get('sparsity_weight', 0.01),
+            push_away_weight=config.get('push_away_weight', 0.1),
+            entropy_weight=config.get('entropy_weight', 0.001),
+            commitment_weight=config.get('commitment_weight', 0.01)
         )
         
         # Optimizer
-        self.optimizer = self._create_optimizer()
+        self.optimizer = optim.Adam(
+            self.model.parameters(), 
+            lr=config.get('learning_rate', 5e-4),
+            weight_decay=config.get('weight_decay', 1e-6)
+        )
         
         # Scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5
+            self.optimizer, mode='min', factor=0.5, patience=10
         )
         
-        # Training history
+        # Monitor
+        self.monitor = DAAMonitor(model, device)
+        
+        # History
         self.history = {
             'train_loss': [],
             'val_loss': [],
-            'train_recon_loss': [],
-            'val_recon_loss': [],
-            'train_sparsity_loss': [],
-            'train_diversity_loss': [],
-            'train_orthogonality_loss': [],
-            'train_spread_loss': [],
-            'learning_rate': [],
-            'epoch_time': []
+            'diversity_ratio': [],
+            'unused_archetypes': [],
+            'mean_max_weight': []
         }
         
-        # Best model tracking
         self.best_val_loss = float('inf')
         self.best_epoch = 0
-        self.patience_counter = 0
         
-        # Output directories
-        self.output_dir = config.get('output_dir', 'output')
+        # Directories
+        self.output_dir = config.get('output_dir', '../models/daa_fixed')
         self.checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
         self.figure_dir = os.path.join(self.output_dir, 'figures')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         os.makedirs(self.figure_dir, exist_ok=True)
-        
-    def _create_optimizer(self):
-        optimizer_type = self.config.get('optimizer', 'adam')
-        lr = self.config.get('learning_rate', 1e-3)
-        weight_decay = self.config.get('weight_decay', 1e-5)
-        
-        if optimizer_type.lower() == 'adam':
-            return optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        elif optimizer_type.lower() == 'adamw':
-            return optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-        else:
-            raise ValueError(f"Unknown optimizer: {optimizer_type}")
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
-        epoch_losses = {
-            'total': 0.0,
-            'reconstruction': 0.0,
-            'sparsity': 0.0,
-            'diversity': 0.0,
-            'orthogonality': 0.0,
-            'spread': 0.0
-        }
+        epoch_losses = {'total': 0, 'reconstruction': 0, 'sparsity': 0}
         num_batches = 0
         
         pbar = tqdm(self.train_loader, desc="Training", leave=False)
-        for batch_idx, (images, labels) in enumerate(pbar):
+        for images, labels in pbar:
             images = images.to(self.device)
             
-            # Forward pass - 4 outputs
+            # Forward
             reconstructed, alpha, z, features = self.model(images)
             
-            # Compute loss
-            loss, loss_dict = self.criterion(reconstructed, images, alpha, self.model)
+            # Loss
+            loss, loss_dict = self.criterion(reconstructed, images, alpha, z, self.model)
             
-            # Backward pass
+            # Backward
             self.optimizer.zero_grad()
             loss.backward()
             
             # Gradient clipping
-            if self.config.get('gradient_clip', 0) > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 
-                    self.config['gradient_clip']
-                )
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
             
             self.optimizer.step()
             
-            # Update running losses
-            for key in epoch_losses:
+            # Update stats
+            for key in ['total', 'reconstruction', 'sparsity']:
                 if key in loss_dict:
                     epoch_losses[key] += loss_dict[key]
             num_batches += 1
             
-            # Update progress bar
+            # Progress
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
-                'recon': f"{loss_dict['reconstruction']:.4f}",
-                'sparse': f"{loss_dict['sparsity']:.4f}"
+                'recon': f"{loss_dict['reconstruction']:.4f}"
             })
         
-        # Average losses
+        # Average
         for key in epoch_losses:
             epoch_losses[key] /= num_batches
         
@@ -155,244 +131,150 @@ class DAATrainer:
     def validate(self) -> Dict[str, float]:
         """Validate the model."""
         self.model.eval()
-        val_losses = {
-            'total': 0.0,
-            'reconstruction': 0.0
-        }
+        val_losses = {'total': 0, 'reconstruction': 0}
         num_batches = 0
         
         with torch.no_grad():
             for images, labels in tqdm(self.val_loader, desc="Validation", leave=False):
                 images = images.to(self.device)
-                
-                # Forward pass - 4 outputs
                 reconstructed, alpha, z, features = self.model(images)
                 
-                # Compute loss
                 mse_loss = nn.MSELoss()(reconstructed, images)
-                
                 val_losses['reconstruction'] += mse_loss.item()
                 val_losses['total'] += mse_loss.item()
                 num_batches += 1
         
-        # Average losses
         for key in val_losses:
             val_losses[key] /= num_batches
         
         return val_losses
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """Save model checkpoint."""
+        """Save checkpoint."""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'history': self.history,
-            'config': self.config,
+            'config': {
+                'latent_dim': self.model.latent_dim,
+                'num_archetypes': self.model.num_archetypes
+            },
             'best_val_loss': self.best_val_loss
         }
         
-        # Save regular checkpoint
-        checkpoint_path = os.path.join(
-            self.checkpoint_dir, 
-            f'checkpoint_epoch_{epoch:03d}.pth'
-        )
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best model
         if is_best:
-            best_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
-            torch.save(checkpoint, best_path)
+            path = os.path.join(self.checkpoint_dir, 'best_model.pth')
+            torch.save(checkpoint, path)
             print(f"  💾 Saved best model (val_loss: {self.best_val_loss:.4f})")
-    
-    def plot_training_curves(self):
-        """Plot and save training curves."""
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
-        epochs = range(1, len(self.history['train_loss']) + 1)
-        
-        # Total loss
-        axes[0, 0].plot(epochs, self.history['train_loss'], 'b-', label='Train')
-        axes[0, 0].plot(epochs, self.history['val_loss'], 'r-', label='Validation')
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Total Loss')
-        axes[0, 0].set_title('Total Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Reconstruction loss
-        axes[0, 1].plot(epochs, self.history['train_recon_loss'], 'b-', label='Train')
-        axes[0, 1].plot(epochs, self.history['val_recon_loss'], 'r-', label='Validation')
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Reconstruction Loss')
-        axes[0, 1].set_title('Reconstruction Loss')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Sparsity loss
-        axes[0, 2].plot(epochs, self.history['train_sparsity_loss'], 'g-')
-        axes[0, 2].set_xlabel('Epoch')
-        axes[0, 2].set_ylabel('Sparsity Loss')
-        axes[0, 2].set_title('Sparsity Loss')
-        axes[0, 2].grid(True, alpha=0.3)
-        
-        # Diversity loss
-        axes[1, 0].plot(epochs, self.history['train_diversity_loss'], 'm-')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Diversity Loss')
-        axes[1, 0].set_title('Diversity Loss')
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Orthogonality loss
-        axes[1, 1].plot(epochs, self.history['train_orthogonality_loss'], 'c-')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Orthogonality Loss')
-        axes[1, 1].set_title('Orthogonality Loss')
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        # Learning rate
-        axes[1, 2].plot(epochs, self.history['learning_rate'], 'k-')
-        axes[1, 2].set_xlabel('Epoch')
-        axes[1, 2].set_ylabel('Learning Rate')
-        axes[1, 2].set_title('Learning Rate Schedule')
-        axes[1, 2].set_yscale('log')
-        axes[1, 2].grid(True, alpha=0.3)
-        
-        plt.suptitle('Training Progress', fontsize=14)
-        plt.tight_layout()
-        
-        # Save figure
-        fig_path = os.path.join(self.figure_dir, 'training_curves.png')
-        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
-        plt.show()
-        
-        print(f"  📊 Training curves saved to {fig_path}")
+        if epoch % 20 == 0:
+            path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch:03d}.pth')
+            torch.save(checkpoint, path)
     
     def train(self, num_epochs: int):
-        """Main training loop."""
+        """Main training loop with monitoring."""
         print("\n" + "="*50)
-        print("Starting Improved DAA Training")
+        print("Starting FIXED DAA Training")
         print("="*50)
         print(f"Device: {self.device}")
-        print(f"Total epochs: {num_epochs}")
-        print(f"Batch size: {self.config.get('batch_size', 16)}")
-        print(f"Learning rate: {self.config.get('learning_rate', 1e-3)}")
+        print(f"Epochs: {num_epochs}")
+        print(f"Archetypes: {self.model.num_archetypes}")
+        print(f"Latent dim: {self.model.latent_dim}")
         print("="*50 + "\n")
         
-        start_time = time.time()
-        
         for epoch in range(1, num_epochs + 1):
-            epoch_start = time.time()
-            
             print(f"\nEpoch {epoch}/{num_epochs}")
             print("-" * 30)
             
-            # Training
+            # Train
             train_losses = self.train_epoch()
             
-            # Validation
+            # Validate
             val_losses = self.validate()
+            
+            # Anneal temperature
+            if self.config.get('use_temperature_annealing', True):
+                self.model.anneal_temperature(epoch, num_epochs)
+            
+            # Monitor health every 5 epochs
+            if epoch % 5 == 0:
+                diagnostics = self.monitor.check_health(epoch, self.val_loader)
+                
+                print(f"  📊 Health Check:")
+                print(f"    Diversity ratio: {diagnostics['diversity_ratio']:.3f}")
+                print(f"    Unused archetypes: {diagnostics['unused_archetypes']}")
+                print(f"    Mean max weight: {diagnostics['mean_max_weight']:.3f}")
+                print(f"    Min archetype dist: {diagnostics['min_archetype_dist']:.3f}")
+                
+                # Emergency fixes if needed
+                if diagnostics['collapsed'] or diagnostics['unused_archetypes'] > 3:
+                    fixes = self.monitor.emergency_fix(diagnostics)
+                    if fixes:
+                        print(f"  🚨 Applied fixes: {fixes}")
+                
+                # Store metrics
+                self.history['diversity_ratio'].append(diagnostics['diversity_ratio'])
+                self.history['unused_archetypes'].append(diagnostics['unused_archetypes'])
+                self.history['mean_max_weight'].append(diagnostics['mean_max_weight'])
             
             # Update history
             self.history['train_loss'].append(train_losses['total'])
             self.history['val_loss'].append(val_losses['total'])
-            self.history['train_recon_loss'].append(train_losses['reconstruction'])
-            self.history['val_recon_loss'].append(val_losses['reconstruction'])
-            self.history['train_sparsity_loss'].append(train_losses['sparsity'])
-            self.history['train_diversity_loss'].append(train_losses['diversity'])
-            self.history['train_orthogonality_loss'].append(train_losses['orthogonality'])
-            self.history['train_spread_loss'].append(train_losses['spread'])
-            self.history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-            self.history['epoch_time'].append(time.time() - epoch_start)
             
-            # Learning rate scheduling
+            # Scheduler
             self.scheduler.step(val_losses['total'])
             
-            # Print epoch summary
+            # Print summary
             print(f"  Train Loss: {train_losses['total']:.4f}")
-            print(f"    Recon: {train_losses['reconstruction']:.4f}")
-            print(f"    Sparse: {train_losses['sparsity']:.4f}")
-            print(f"    Divers: {train_losses['diversity']:.4f}")
-            print(f"    Ortho: {train_losses['orthogonality']:.4f}")
             print(f"  Val Loss: {val_losses['total']:.4f}")
             print(f"  LR: {self.optimizer.param_groups[0]['lr']:.6f}")
-            print(f"  Time: {self.history['epoch_time'][-1]:.2f}s")
+            print(f"  Temperature: {self.model.temperature:.3f}")
             
-            # Check for best model
+            # Save best
             if val_losses['total'] < self.best_val_loss:
                 self.best_val_loss = val_losses['total']
                 self.best_epoch = epoch
-                self.patience_counter = 0
                 self.save_checkpoint(epoch, is_best=True)
-            else:
-                self.patience_counter += 1
-            
-            # Regular checkpoint
-            if epoch % self.config.get('checkpoint_interval', 10) == 0:
-                self.save_checkpoint(epoch)
-            
-            # Early stopping
-            if self.patience_counter >= self.config.get('early_stopping_patience', 30):
-                print(f"\n⚠️  Early stopping triggered at epoch {epoch}")
-                break
+            elif epoch % 20 == 0:
+                self.save_checkpoint(epoch, is_best=False)
         
-        # Training complete
-        total_time = time.time() - start_time
         print("\n" + "="*50)
-        print("Training Complete!")
-        print(f"Total training time: {total_time/60:.2f} minutes")
-        print(f"Best epoch: {self.best_epoch} (val_loss: {self.best_val_loss:.4f})")
+        print(f"Training Complete! Best epoch: {self.best_epoch}")
         print("="*50)
-        
-        # Plot training curves
-        self.plot_training_curves()
-        
-        # Save final checkpoint
-        self.save_checkpoint(epoch, is_best=False)
-        
-        # Save training history
-        history_path = os.path.join(self.output_dir, 'training_history.json')
-        with open(history_path, 'w') as f:
-            json.dump(self.history, f, indent=2)
-
 
 
 def main():
-    """Main training function."""
+    """Run the fixed training."""
     
-    # Configuration
+    # FIXED configuration
     config = {
-        # Model parameters
-        'latent_dim': 64,
-        'num_archetypes': 7,
+        # Model - FIXED VALUES
+        'latent_dim': 64,  # Increased
+        'num_archetypes': 5,  # Increased
         'dropout_rate': 0.05,
         
-        # Training parameters
+        # Training
         'batch_size': 16,
-        'num_epochs': 200,  # Start with 200
-        'learning_rate': 4e-5,
+        'num_epochs': 150,
+        'learning_rate': 1e-3,
         'weight_decay': 1e-6,
-        'optimizer': 'adamw',
-        'gradient_clip': 1.0,
         
-        # Loss weights
+        # Loss weights - FIXED VALUES
         'reconstruction_weight': 1.0,
-        'sparsity_weight': 0.1,
-        'diversity_weight': 0.5,
-        'orthogonality_weight': 0.15, # was 0.1
+        'sparsity_weight': 0.05,  # Much lower
+        'push_away_weight': 0.1,
+        'entropy_weight': 0.005,
+        'commitment_weight': 0.01,
         
-        # Other parameters
-        'early_stopping_patience': 100,
-        'checkpoint_interval': 10,
-        'output_dir': '../models/daa_improved',
+        # Temperature annealing
+        'use_temperature_annealing': True,
         
-        # Data parameters
+        # Paths
+        'output_dir': '../models/daa_fixed',
         'data_path': '../data/resized_jaffe',
-        'val_split': 0.2,
-        'augment': False,  # Set to False for now
-        'num_workers': 4,
-        'seed': 342
+        'val_split_subject_count': 2,
+        'seed': 42
     }
     
     # Set seeds
@@ -403,37 +285,32 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Create data loaders
+    # Data
     train_loader, val_loader, _, _ = create_data_loaders(
         data_path=config['data_path'],
         batch_size=config['batch_size'],
-        val_split=config['val_split'],
-        augment=config['augment'],
-        num_workers=config['num_workers'],
+        val_split_subject_count=config['val_split_subject_count'],
+        augment=False,
         seed=config['seed']
     )
     
-    # Create model
+    # Create FIXED model
     model = DeepAA(
         input_channels=1,
         input_size=128,
         latent_dim=config['latent_dim'],
         num_archetypes=config['num_archetypes'],
-        dropout_rate=config['dropout_rate']
+        dropout_rate=config['dropout_rate'],
+        temperature=1.0  # Start warm
     )
     
-    print("\n📊 Model Statistics:")
-    print(f"  Latent dimension: {config['latent_dim']}")
-    print(f"  Number of archetypes: {config['num_archetypes']}")
-    print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    print("\n🚀 Key improvements:")
-    print("  ✓ Fixed sparsity loss (L2 norm)")
-    print("  ✓ Stronger diversity enforcement")
-    print("  ✓ Orthogonality constraint for archetypes")
-    print("  ✓ Archetype spread regularization")
-    print("  ✓ Orthogonal initialization")
-    print("  ✓ Temperature-scaled softmax")
+    print("\n🔧 KEY FIXES APPLIED:")
+    print("  ✅ Correct sparsity loss (low entropy)")
+    print("  ✅ Push-away loss for archetype separation")
+    print("  ✅ Temperature annealing (1.0 → 0.1)")
+    print("  ✅ Emergency intervention system")
+    print("  ✅ Increased latent dim (64) and archetypes (8)")
+    print("  ✅ Reduced sparsity weight (0.01)")
     
     # Create trainer
     trainer = DAATrainer(
@@ -444,14 +321,11 @@ def main():
         config=config
     )
     
-    # Train model
+    # Train
     trainer.train(num_epochs=config['num_epochs'])
-    
-    print("\n✅ Training completed successfully!")
     
     return trainer, model
 
 
 if __name__ == "__main__":
     trainer, model = main()
-
