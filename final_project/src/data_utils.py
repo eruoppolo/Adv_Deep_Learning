@@ -123,7 +123,6 @@ class JAFFEDataset(Dataset):
             return image, label, img_name
         return image, label
 
-
 def get_data_transforms(
     image_size: int = 128,
     augment: bool = False,
@@ -176,100 +175,6 @@ def get_data_transforms(
     val_transform = transforms.Compose(base_transforms)
     
     return train_transform, val_transform
-
-def old_create_data_loaders(
-    data_path: str,
-    batch_size: int = 16,
-    val_split: float = 0.2,
-    image_size: int = 128,
-    augment: bool = True,
-    num_workers: int = 2,
-    seed: int = 42
-) -> Tuple[DataLoader, DataLoader, Dataset, Dataset]:
-    """
-    Create training and validation data loaders.
-    
-    Args:
-        data_path: Path to JAFFE dataset
-        batch_size: Batch size for data loaders
-        val_split: Validation split ratio (0.2 = 20% validation)
-        image_size: Target image size
-        augment: Whether to use data augmentation for training
-        num_workers: Number of workers for data loading
-        seed: Random seed for reproducibility
-        
-    Returns:
-        train_loader, val_loader, train_dataset, val_dataset
-    """
-    # Set random seed for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    # Get transforms
-    train_transform, val_transform = get_data_transforms(
-        image_size=image_size,
-        augment=augment
-    )
-    
-    # Create full dataset with validation transforms (for splitting)
-    full_dataset = JAFFEDataset(
-        folder_path=data_path,
-        transform=val_transform,
-        augment=False
-    )
-    
-    # Calculate split sizes
-    total_size = len(full_dataset)
-    val_size = int(total_size * val_split)
-    train_size = total_size - val_size
-    
-    # Random split
-    train_indices, val_indices = random_split(
-        range(total_size),
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(seed)
-    )
-    
-    # Create separate datasets for train and validation with appropriate transforms
-    train_dataset = JAFFEDataset(
-        folder_path=data_path,
-        transform=train_transform,
-        augment=augment
-    )
-    
-    val_dataset = JAFFEDataset(
-        folder_path=data_path,
-        transform=val_transform,
-        augment=False
-    )
-    
-    # Create subset datasets
-    train_subset = torch.utils.data.Subset(train_dataset, train_indices.indices)
-    val_subset = torch.utils.data.Subset(val_dataset, val_indices.indices)
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_subset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    val_loader = DataLoader(
-        val_subset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
-    )
-    
-    print(f"\nData split:")
-    print(f"  Training samples: {train_size}")
-    print(f"  Validation samples: {val_size}")
-    print(f"  Total samples: {total_size}")
-    
-    return train_loader, val_loader, train_subset, val_subset
 
 def create_data_loaders(
     data_path: str,

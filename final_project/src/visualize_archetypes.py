@@ -50,10 +50,10 @@ class ArchetypeAnalyzer:
         # Create data loader
         _, self.val_loader, _, _ = create_data_loaders(
             data_path=data_path,
-            batch_size=16,
-            val_split_subject_count=7,
+            batch_size=8,
+            val_split_subject_count=3,
             augment=False,
-            seed=42
+            seed=342
         )
         
         print(f"✅ Loaded model from {model_path}")
@@ -74,7 +74,7 @@ class ArchetypeAnalyzer:
             latent_dim=model_config.get('latent_dim', 16),
             num_archetypes=model_config.get('num_archetypes', 7),
             dropout_rate=model_config.get('dropout_rate', 0.05),
-            temperature=model_config.get('temperature', 1.0)
+            # temperature=model_config.get('temperature', 1.0)
         )
 
         
