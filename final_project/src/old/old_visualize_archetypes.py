@@ -11,12 +11,10 @@ import matplotlib.gridspec as gridspec
 from sklearn.manifold import TSNE
 import seaborn as sns
 from typing import Optional, List, Tuple
-from sklearn.decomposition import PCA
-from scipy.spatial import ConvexHull
 
 # Import our modules
 from deep_aa_model import DeepAA
-from mnist_data_utils import create_mnist_dataloaders
+from data_utils import create_data_loaders, EMOTION_NAMES
 
 
 class ArchetypeAnalyzer:
@@ -27,7 +25,7 @@ class ArchetypeAnalyzer:
     def __init__(
         self,
         model_path: str,
-        target_digit: int,
+        data_path: str,
         device: torch.device,
         output_dir: str = '../features'
     ):
@@ -42,9 +40,7 @@ class ArchetypeAnalyzer:
         """
         self.device = device
         self.output_dir = output_dir
-        self.target_digit = target_digit  # Digit to analyze (0-9)
-        self.figure_dir = os.path.join(output_dir, f'figures_mnist_digit_{self.target_digit}')
-        os.makedirs(self.figure_dir, exist_ok=True)
+        self.figure_dir = os.path.join(output_dir, '../figures')
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.figure_dir, exist_ok=True)
         
@@ -52,12 +48,15 @@ class ArchetypeAnalyzer:
         self.model = self._load_model(model_path)
         
         # Create data loader
-        _, self.val_loader = create_mnist_dataloaders(
-            target_digit=self.target_digit,
-            batch_size=128
+        _, self.val_loader, _, _ = create_data_loaders(
+            data_path=data_path,
+            batch_size=8,
+            val_split_subject_count=2,
+            augment=False,
+            seed=342
         )
         
-        print(f"✅ Loaded model from {model_path} for digit '{self.target_digit}'")
+        print(f"✅ Loaded model from {model_path}")
         print(f"📊 Number of archetypes: {self.model.num_archetypes}")
         print(f"📏 Latent dimension: {self.model.latent_dim}")
     
@@ -72,10 +71,11 @@ class ArchetypeAnalyzer:
         model_config = checkpoint.get('config', {})
         model = DeepAA(
             input_channels=1,
-            input_size=32,
+            input_size=128,
             latent_dim=model_config.get('latent_dim', 16),
             num_archetypes=model_config.get('num_archetypes', 7),
             dropout_rate=model_config.get('dropout_rate', 0.05),
+            # temperature=model_config.get('temperature', 1.0)
         )
 
         
@@ -263,10 +263,12 @@ class ArchetypeAnalyzer:
         sns.scatterplot(
             x=sample_tsne_points[:, 0], 
             y=sample_tsne_points[:, 1], 
-            s=50,
-            alpha=0.6,
-            linewidth=0,
-            label='Samples' # Single label for all points
+            hue=[EMOTION_NAMES[l] for l in sample_labels], # Use string labels for legend
+            palette="tab10", # A categorical palette
+            s=50, # Marker size
+            alpha=0.7, # Transparency
+            linewidth=0, # No lines around markers
+            legend='full'
         )
         
         # Plot archetype points with distinct markers and labels
@@ -306,88 +308,59 @@ class ArchetypeAnalyzer:
         plt.close() # Close the plot to free memory
         print(f"📊 Saved t-SNE latent space visualization to {save_path}")
     
-    def visualize_latent_space_pca(self, samples_z: np.ndarray):
+    def analyze_archetype_usage(self, alphas: np.ndarray, labels: np.ndarray):
         """
-        Visualize the latent space using PCA to faithfully represent the convex hull.
+        Analyze how different emotions use different archetypes.
+        
+        Args:
+            alphas: Archetypal weights [N, num_archetypes]
+            labels: Emotion labels [N]
         """
-        print("  Running PCA on latent space data...")
-        archetypes_latent = self.model.get_archetypes()
+        # Create figure
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8)) # 7 emotions + 1 empty for 2x4 grid
+        axes = axes.flatten()
         
-        # 1. Combine samples and archetypes for a unified PCA fit
-        combined_data = np.vstack((samples_z, archetypes_latent))
-        
-        # 2. Fit PCA and transform the data to 2D
-        pca = PCA(n_components=2)
-        pca.fit(combined_data) 
-        
-        samples_pca = pca.transform(samples_z)
-        archetypes_pca = pca.transform(archetypes_latent)
-        
-        plt.figure(figsize=(12, 10))
-        
-        # 3. Plot the projected samples
-        plt.scatter(
-            samples_pca[:, 0], 
-            samples_pca[:, 1], 
-            s=30, 
-            alpha=0.4, 
-            label='Samples'
-        )
-        
-        # 4. Plot the projected archetypes
-        plt.scatter(
-            archetypes_pca[:, 0], 
-            archetypes_pca[:, 1], 
-            marker='D', 
-            s=50, 
-            color='red', 
-            edgecolor='black', 
-            linewidth=1.5,
-            zorder=10,
-            label='Archetypes'
-        )
-                
-        for i in range(len(archetypes_pca)):
-            x_coord = archetypes_pca[i, 0]
-            y_coord = archetypes_pca[i, 1]
-
-            # A small offset suitable for the plot's scale
-            offset = 0.01 
+        # Analyze per emotion
+        for emotion_idx in range(len(EMOTION_NAMES)):
+            emotion_name = EMOTION_NAMES[emotion_idx]
+            emotion_mask = labels == emotion_idx
             
-            plt.text(
-                x_coord + offset,  # Position text slightly to the right of the diamond
-                y_coord,           # At the same vertical level as the diamond
-                f'{i+1}',          # The archetype number
-                fontsize=16,
-                fontweight='bold',
-                color='red',
-                ha='left',         # Horizontal Alignment: text starts at the coordinate
-                va='center',       # Vertical Alignment: text is centered vertically on the coordinate
-                zorder=11
-            )
-        # --- END OF FIX ---
+            ax = axes[emotion_idx] # Assign to the current subplot
+            
+            if np.sum(emotion_mask) > 0:
+                emotion_alphas = alphas[emotion_mask]
+                mean_alpha = np.mean(emotion_alphas, axis=0)
+                std_alpha = np.std(emotion_alphas, axis=0)
                 
-        # 5. Draw the convex hull formed by the archetypes
-        hull = ConvexHull(archetypes_pca)
-        for simplex in hull.simplices:
-            plt.plot(archetypes_pca[simplex, 0], archetypes_pca[simplex, 1], 'r--', lw=2)
+                x = np.arange(len(mean_alpha))
+                ax.bar(x, mean_alpha, yerr=std_alpha, capsize=5, 
+                       color='steelblue', alpha=0.7, edgecolor='black')
+                ax.set_xlabel('Archetype', fontsize=10)
+                ax.set_ylabel('Weight', fontsize=10)
+                ax.set_title(f'{emotion_name}', fontsize=11, fontweight='bold')
+                ax.set_ylim([0, 1])
+                ax.set_xticks(x)
+                ax.set_xticklabels([f'A{i+1}' for i in x])
+                ax.grid(True, alpha=0.3)
+            else:
+                # If an emotion has no samples in the validation set, plot an empty graph or note it.
+                ax.set_title(f'{emotion_name} (No samples)', fontsize=11, fontweight='bold')
+                ax.axis('off') # Hide axes for empty plots
         
-        # Add a final closing line to the hull plot
-        plt.plot([archetypes_pca[hull.vertices[-1], 0], archetypes_pca[hull.vertices[0], 0]],
-                [archetypes_pca[hull.vertices[-1], 1], archetypes_pca[hull.vertices[0], 1]], 'r--', lw=2)
-
-        plt.title('PCA Visualization of Latent Space (Samples & Archetypes)', fontsize=16, fontweight='bold')
-        plt.xlabel('Principal Component 1', fontsize=12)
-        plt.ylabel('Principal Component 2', fontsize=12)
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-        plt.axis('equal') # Use equal aspect ratio for a true geometric representation
+        # Hide any extra subplot if num_archetypes is not matching the grid size
+        if len(EMOTION_NAMES) < len(axes):
+            for i in range(len(EMOTION_NAMES), len(axes)):
+                axes[i].axis('off')
         
-        save_path = os.path.join(self.figure_dir, 'latent_space_pca.png')
+        plt.suptitle('Archetype Usage by Emotion', fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust rect to make space for suptitle
+        
+        # Save figure
+        save_path = os.path.join(self.figure_dir, 'archetype_usage_by_emotion.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"📊 Saved PCA latent space visualization to {save_path}")
-    
+        plt.close(fig) # Close figure to free memory
+        
+        print(f"📊 Saved archetype usage analysis to {save_path}")
     
     def visualize_weight_distribution(self, alphas: np.ndarray):
         """
@@ -471,6 +444,8 @@ class ArchetypeAnalyzer:
                 axes[0, i].set_ylabel('Original', fontsize=11)
             
             # Get emotion name
+            emotion = EMOTION_NAMES[labels[i]] if labels[i] >= 0 else 'Unknown'
+            axes[0, i].set_title(emotion, fontsize=10, fontweight='bold')
             
             # Reconstructed
             recon = reconstructed[i].squeeze().cpu().numpy()
@@ -527,10 +502,14 @@ class ArchetypeAnalyzer:
         print("\n5. Extracting latent Z representations for samples...")
         samples_z, _ = self.extract_archetypal_latent_representation() # labels are same as alpha labels
         
-        # 6. Visualize latent space with PCA
-        print("\n6. Visualizing latent space with PCA...")
-        self.visualize_latent_space_pca(samples_z)
-
+        # 6. Visualize latent space with t-SNE
+        print("\n6. Visualizing latent space with t-SNE...")
+        self.visualize_latent_space_tsne(samples_z=samples_z, sample_labels=labels)
+        
+        # 7. Analyze archetype usage
+        print("\n7. Analyzing archetype usage by emotion...")
+        self.analyze_archetype_usage(alphas, labels)
+        
         # 8. Visualize weight distribution
         print("\n8. Visualizing weight distribution...")
         self.visualize_weight_distribution(alphas)
@@ -560,25 +539,28 @@ class ArchetypeAnalyzer:
 
 
 def main():
-    TARGET_DIGIT = 8
-    NUM_ARCHETYPES = 3
-
+    """Main function to run archetype analysis."""
+    
+    # Configuration
     config = {
-        'model_path': f'../models/daa_mnist_digit_{TARGET_DIGIT}/checkpoints/best_model.pth',
-        'target_digit': TARGET_DIGIT,
-        'output_dir': f'../models/daa_mnist_digit_{TARGET_DIGIT}'
+        'model_path': '../models/daa_fixed_7arch/checkpoints/best_model.pth',
+        'data_path': '../data/resized_jaffe',
+        'output_dir': '../features'
     }
     
+    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # Create analyzer
     analyzer = ArchetypeAnalyzer(
         model_path=config['model_path'],
-        target_digit=config['target_digit'],
+        data_path=config['data_path'],
         device=device,
         output_dir=config['output_dir']
     )
     
+    # Run complete analysis
     analyzer.run_complete_analysis()
 
 

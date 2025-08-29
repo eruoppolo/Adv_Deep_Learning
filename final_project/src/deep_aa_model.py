@@ -96,64 +96,20 @@ class DAAMonitor:
         return fixes_applied
 
 
-def test_model():
-    """Test function to verify model architecture."""
-    print("Testing Enhanced DAA Model...")
-    
-    # Create model
-    model = DeepAA(
-        input_channels=1,
-        input_size=128,
-        latent_dim=16,
-        num_archetypes=7
-    )
-    
-    # Create dummy input
-    batch_size = 4
-    x = torch.randn(batch_size, 1, 128, 128)
-    
-    # Forward pass
-    reconstructed, alpha, z, _ = model(x)
-    
-    # Check output shapes
-    print(f"Input shape: {x.shape}")
-    print(f"Reconstructed shape: {reconstructed.shape}")
-    print(f"Alpha (weights) shape: {alpha.shape}")
-    print(f"Z (latent) shape: {z.shape}")
-    print(f"Archetypes shape: {model.archetypes.shape}")
-    
-    # Test loss computation
-    loss_fn = DAALoss()
-    total_loss, loss_dict = loss_fn(reconstructed, x, alpha, model)
-    
-    print("\nLoss components:")
-    for key, value in loss_dict.items():
-        print(f"  {key}: {value:.4f}")
-    
-    # Check that alpha sums to 1
-    alpha_sum = alpha.sum(dim=1)
-    print(f"\nAlpha sum per sample (should be ~1.0): {alpha_sum}")
-    
-    print("\n✅ Model test passed!")
-    
-    return model
-
-
 class DeepAA(nn.Module):
     """
-    Fixed Deep Archetypal Analysis with proper convex hull constraints.
+    Fixed Deep Archetypal Analysis with proper convex hull constraints and stable architecture.
     """
     
     def __init__(
         self, 
         input_channels: int = 1,
-        input_size: int = 128,
-        latent_dim: int = 32,  # Reduced from 64
-        num_archetypes: int = 7,  # Increased from 5
+        input_size: int = 32,
+        latent_dim: int = 16,
+        num_archetypes: int = 4,  # Set to 3 to match visuals
         encoder_channels: list = None,
         decoder_channels: list = None,
-        dropout_rate: float = 0.1,
-        use_batch_norm: bool = True
+        dropout_rate: float = 0.1
     ):
         super(DeepAA, self).__init__()
         
@@ -162,16 +118,22 @@ class DeepAA(nn.Module):
         self.latent_dim = latent_dim
         self.num_archetypes = num_archetypes
         
-        if encoder_channels is None:
-            encoder_channels = [32, 64, 128, 256]
-        if decoder_channels is None:
-            decoder_channels = [256, 128, 64, 32]
+        # if encoder_channels is None:
+        #     encoder_channels = [32, 64, 128, 256]
+        # if decoder_channels is None:
+        #     decoder_channels = [256, 128, 64, 32]
             
+        
+        if encoder_channels is None:
+            encoder_channels = [16, 32, 64]
+        if decoder_channels is None:
+            decoder_channels = [64, 32, 16]
+
         self.encoded_size = input_size // (2 ** len(encoder_channels))
         self.encoder_output_dim = encoder_channels[-1] * self.encoded_size * self.encoded_size
         
         # Build encoder
-        self.encoder_cnn = self._build_encoder(encoder_channels, dropout_rate, use_batch_norm)
+        self.encoder_cnn = self._build_encoder(encoder_channels, dropout_rate)
         
         # CRITICAL FIX 1: Simpler, more direct alpha network
         self.encoder_to_alpha = nn.Sequential(
@@ -188,198 +150,136 @@ class DeepAA(nn.Module):
         
         # Decoder
         self.decoder_fc = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(256, self.encoder_output_dim),
+            nn.Linear(latent_dim, self.encoder_output_dim),
+            nn.BatchNorm1d(self.encoder_output_dim), # BN before ReLU
             nn.ReLU()
         )
         
-        self.decoder_cnn = self._build_decoder(decoder_channels, dropout_rate, use_batch_norm)
+        self.decoder_cnn = self._build_decoder(decoder_channels)
     
     def _initialize_archetypes_properly(self):
-        """Initialize archetypes as orthogonal vectors."""
-        # Use orthogonal initialization for better separation
-        ortho_matrix = torch.empty(self.latent_dim, self.latent_dim)
-        nn.init.orthogonal_(ortho_matrix)
-        
-        if self.num_archetypes <= self.latent_dim:
-            self.archetypes.data = ortho_matrix[:self.num_archetypes, :] * 2.0
-        else:
-            # If more archetypes than dimensions, add noise to orthogonal base
-            base = ortho_matrix[:min(self.num_archetypes, self.latent_dim), :]
-            extra = torch.randn(self.num_archetypes - self.latent_dim, self.latent_dim)
-            self.archetypes.data = torch.cat([base, extra], dim=0) * 2.0
+        """Initialize archetypes with some separation."""
+        # Use orthogonal initialization for better separation, scaled up.
+        torch.nn.init.orthogonal_(self.archetypes, gain=np.sqrt(self.latent_dim))
     
-    def _build_encoder(self, channels, dropout_rate, use_batch_norm):
+    def _build_encoder(self, channels, dropout_rate):
         layers = []
         in_channels = self.input_channels
         
-        for i, out_channels in enumerate(channels):
-            layers.append(nn.Conv2d(in_channels, out_channels, 3, stride=2, padding=1))
-            if use_batch_norm:
-                layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(nn.ReLU())
-            if dropout_rate > 0 and i < len(channels) - 1:
-                layers.append(nn.Dropout2d(dropout_rate))
+        for out_channels in channels:
+            layers.extend([
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(),
+                nn.Dropout2d(dropout_rate)
+            ])
             in_channels = out_channels
-            
         return nn.Sequential(*layers)
     
-    def _build_decoder(self, channels, dropout_rate, use_batch_norm):
+    def _build_decoder(self, channels):
         layers = [nn.Unflatten(1, (channels[0], self.encoded_size, self.encoded_size))]
+        in_channels = channels[0]
         
-        for i in range(len(channels) - 1):
-            layers.append(nn.ConvTranspose2d(channels[i], channels[i+1], 3, stride=2, padding=1, output_padding=1))
-            if use_batch_norm:
-                layers.append(nn.BatchNorm2d(channels[i+1]))
-            layers.append(nn.ReLU())
-            if dropout_rate > 0 and i < len(channels) - 2:
-                layers.append(nn.Dropout2d(dropout_rate))
+        for out_channels in channels[1:]:
+            layers.extend([
+                nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU()
+            ])
+            in_channels = out_channels
         
-        layers.append(nn.ConvTranspose2d(channels[-1], self.input_channels, 3, stride=2, padding=1, output_padding=1))
-        layers.append(nn.Tanh())
+        layers.append(nn.ConvTranspose2d(in_channels, self.input_channels, kernel_size=3, stride=2, padding=1, output_padding=1))
+        layers.append(nn.Tanh()) # Ensure output is in [-1, 1] if data is normalized
         
         return nn.Sequential(*layers)
     
-    def encode(self, x):
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode input to archetypal coefficients."""
         h = self.encoder_cnn(x)
         h = h.view(h.size(0), -1)
         logits = self.encoder_to_alpha(h)
-        
-        # CRITICAL FIX 3: Use stable softmax with temperature
-        # Start with high temperature (1.0) and anneal to low (0.1)
         alpha = F.softmax(logits, dim=1)
-        
         return alpha, logits
-    
-    def forward(self, x):
-        # Get archetypal coefficients
-        alpha, logits = self.encode(x)
-        
-        # Convex combination of archetypes
-        z = torch.matmul(alpha, self.archetypes)
-        
-        # Decode
-        reconstructed = self.decode(z)
-        
-        return reconstructed, alpha, z, logits
     
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         h = self.decoder_fc(z)
         out = self.decoder_cnn(h)
         return out
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Get archetypal coefficients
+        alpha, logits = self.encode(x)
+        
+        # Convex combination of archetypes to form latent representation z
+        z = torch.matmul(alpha, self.archetypes)
+        
+        # Decode z to reconstruct the image
+        reconstructed = self.decode(z)
+        
+        return reconstructed, alpha, z, logits
     
-    def get_archetypes(self):
+    def get_archetypes(self) -> np.ndarray:
         return self.archetypes.detach().cpu().numpy()
 
 
 class DAALoss(nn.Module):
     """
-    Loss function specifically designed to prevent collapse to single archetype.
+    CRITICAL FIX 3: A robust loss function to prevent collapse.
     """
-    
     def __init__(
         self,
         reconstruction_weight: float = 1.0,
-        sparsity_weight: float = 0.1,  # Reduced
-        diversity_weight: float = 0.3,  # Increased significantly
-        separation_weight: float = 0.2,  # New: ensure archetypes stay separated
+        sparsity_weight: float = 0.1,
+        diversity_weight: float = 0.5,
+        separation_weight: float = 0.3,
     ):
-        super(DAALoss, self).__init__()
+        super().__init__()
         self.reconstruction_weight = reconstruction_weight
         self.sparsity_weight = sparsity_weight
         self.diversity_weight = diversity_weight
         self.separation_weight = separation_weight
         
-    def forward(self, reconstructed, original, alpha, z, logits, model):
-        batch_size = original.size(0)
-        device = original.device
-        K = model.num_archetypes
-        
-        # 1. Reconstruction loss
+    def forward(self, reconstructed: torch.Tensor, original: torch.Tensor, alpha: torch.Tensor, model: DeepAA) -> Tuple[torch.Tensor, dict]:
+        # 1. Reconstruction Loss
         recon_loss = F.mse_loss(reconstructed, original)
         
-        # 2. MODIFIED Sparsity: Want sparse but NOT single-archetype
-        # Penalize if max weight is too close to 1.0
-        max_weights = torch.max(alpha, dim=1)[0]
-        
-        # Target sparsity: max weight should be around 0.6-0.8, not 1.0
-        target_max_weight = 0.7
-        sparsity_loss = torch.mean((max_weights - target_max_weight) ** 2)
-        
-        # Also encourage using 2-3 archetypes per sample
-        # Count how many archetypes have weight > 0.1
-        significant_weights = (alpha > 0.1).float().sum(dim=1)
-        target_usage = 2.5  # Want 2-3 archetypes per sample
-        usage_loss = torch.mean((significant_weights - target_usage) ** 2)
-        
-        combined_sparsity = sparsity_loss + 0.5 * usage_loss
-        
-        # 3. STRONG Diversity: All archetypes MUST be used
-        # Penalize heavily if any archetype is underused
+        # 2. Sparsity Loss (encourage commitment to few archetypes)
+        # Penalizes representations that are not close to a 1-hot vector
+        # A simple L1 penalty on the weights encourages sparsity.
+        sparsity_loss = torch.mean(torch.sum(alpha * (1 - alpha), dim=1))
+
+        # 3. Diversity Loss (anti-collapse for archetype usage)
+        # Ensures all archetypes are used across the batch.
         mean_usage = torch.mean(alpha, dim=0)
-        min_usage = torch.min(mean_usage)
+        # Penalize if any archetype's average usage is too low
+        diversity_loss = torch.sum(torch.relu(0.05 - mean_usage)) * 10 
         
-        # Severe penalty if any archetype usage drops below threshold
-        usage_penalty = torch.relu(0.1 - min_usage) * 10.0  # Heavy penalty
-        
-        # Also encourage balanced usage
-        usage_variance = torch.var(mean_usage)
-        diversity_loss = usage_penalty + usage_variance * 5.0
-        
-        # 4. Archetype Separation: Keep archetypes distinct
+        # 4. Separation Loss (anti-collapse for archetypes themselves)
+        # Pushes archetypes away from each other in latent space.
         archetypes = model.archetypes
+        # Normalize to focus on angle, not magnitude
         archetypes_norm = F.normalize(archetypes, p=2, dim=1)
-        
-        # Compute pairwise similarities
-        similarity = torch.matmul(archetypes_norm, archetypes_norm.t())
-        
-        # Penalize high similarity (excluding diagonal)
-        mask = 1 - torch.eye(K, device=device)
-        off_diagonal_sim = similarity * mask
-        
-        # We want negative similarity (orthogonal or opposite)
-        separation_loss = torch.mean(torch.relu(off_diagonal_sim + 0.3))  # Penalize if similarity > -0.3
-        
-        # 5. Entropy bonus: Prevent complete determinism
-        epsilon = 1e-8
-        entropy = -torch.sum(alpha * torch.log(alpha + epsilon), dim=1)
-        entropy_bonus = -torch.mean(entropy) * 0.01  # Small negative = encourage some entropy
-        
-        # Total loss with adaptive weighting
+        # Calculate pairwise cosine similarity
+        cosine_sim = torch.matmul(archetypes_norm, archetypes_norm.t())
+        # Penalize high similarity between different archetypes
+        mask = 1.0 - torch.eye(model.num_archetypes, device=original.device)
+        separation_loss = torch.mean(torch.relu(cosine_sim * mask))
+
+        # Total Weighted Loss
         total_loss = (
             self.reconstruction_weight * recon_loss +
-            self.sparsity_weight * combined_sparsity +
+            self.sparsity_weight * sparsity_loss +
             self.diversity_weight * diversity_loss +
-            self.separation_weight * separation_loss +
-            entropy_bonus
+            self.separation_weight * separation_loss
         )
         
-        # Create detailed loss dictionary
         loss_dict = {
+            'total': total_loss.item(),
             'reconstruction': recon_loss.item(),
-            'sparsity': combined_sparsity.item(),
+            'sparsity': sparsity_loss.item(),
             'diversity': diversity_loss.item(),
             'separation': separation_loss.item(),
-            'total': total_loss.item(),
-            'mean_max_alpha': max_weights.mean().item(),
-            'min_usage': min_usage.item(),
-            'avg_archetypes_used': significant_weights.mean().item()
+            'min_usage': torch.min(mean_usage).item()
         }
         
         return total_loss, loss_dict
-
-
-if __name__ == "__main__":
-    # Run test
-    model = test_model()
-    
-    # Print model summary
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel Statistics:")
-    print(f"  Total parameters: {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")

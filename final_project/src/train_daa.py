@@ -4,28 +4,20 @@ Step 3: Complete training pipeline with logging and checkpointing
 """
 
 import os
-import json
 import time
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-
-# Import our modules
-from deep_aa_model import DeepAA, DAALoss, DAAMonitor
-from data_utils import create_data_loaders, visualize_batch, EMOTION_NAMES
+from deep_aa_model import DeepAA, DAALoss
+# from data_utils import create_data_loaders
+from mnist_data_utils import create_mnist_dataloaders
 
 class DAATrainer:
     """
-    Trainer with anti-collapse mechanisms.
+    Trainer with robust initialization and anti-collapse mechanisms.
     """
     
     def __init__(self, model, train_loader, val_loader, device, config):
@@ -35,183 +27,31 @@ class DAATrainer:
         self.device = device
         self.config = config
         
-        # Use anti-collapse loss
         self.criterion = DAALoss(
-            reconstruction_weight=1.0,
-            sparsity_weight=config.get('sparsity_weight', 0.1),
-            diversity_weight=config.get('diversity_weight', 0.3),
-            separation_weight=config.get('separation_weight', 0.2)
+            reconstruction_weight=config['reconstruction_weight'],
+            sparsity_weight=config['sparsity_weight'],
+            diversity_weight=config['diversity_weight'],
+            separation_weight=config['separation_weight']
         )
         
-        # Optimizer with different learning rates
-        self.optimizer = torch.optim.AdamW([
-            {'params': model.encoder_cnn.parameters(), 'lr': config['lr']},
-            {'params': model.encoder_to_alpha.parameters(), 'lr': config['lr'] * 2},
-            {'params': [model.archetypes], 'lr': config['lr'] * 0.1},  # Slower for archetypes
-            {'params': model.decoder_fc.parameters(), 'lr': config['lr']},
-            {'params': model.decoder_cnn.parameters(), 'lr': config['lr']}
-        ], weight_decay=1e-5)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(), 
+            lr=config['lr'], 
+            weight_decay=config['weight_decay']
+        )
         
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config['num_epochs']
         )
 
-        # History
-        self.history = {
-            'train_loss': [],
-            'val_loss': [],
-            'diversity_ratio': [],
-            'unused_archetypes': [],
-            'mean_max_weight': []
-        }
-        
+        self.history = {'train_loss': [], 'val_loss': []}
         self.best_val_loss = float('inf')
-        self.patience_counter = 0
-        self.collapse_counter = 0
 
-        # Directories
         self.output_dir = config.get('output_dir', '../models/daa_fixed')
         self.checkpoint_dir = os.path.join(self.output_dir, 'checkpoints')
-        self.figure_dir = os.path.join(self.output_dir, 'figures')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        os.makedirs(self.figure_dir, exist_ok=True)
-        
-    def detect_and_fix_collapse(self, epoch):
-        """Detect collapse and apply emergency fixes."""
-        self.model.eval()
-        
-        # Collect alpha statistics
-        all_alphas = []
-        with torch.no_grad():
-            for i, (images, _) in enumerate(self.val_loader):
-                if i >= 5:  # Sample a few batches
-                    break
-                images = images.to(self.device)
-                _, alpha, _, _ = self.model(images)
-                all_alphas.append(alpha)
-        
-        all_alphas = torch.cat(all_alphas, dim=0)
-        mean_usage = torch.mean(all_alphas, dim=0)
-        
-        # Check for collapse
-        unused_archetypes = (mean_usage < 0.01).sum().item()
-        max_usage = torch.max(mean_usage).item()
-        
-        if unused_archetypes >= self.model.num_archetypes - 2 or max_usage > 0.8:
-            self.collapse_counter += 1
-            print(f"\n⚠️ COLLAPSE DETECTED at epoch {epoch}!")
-            print(f"  Unused archetypes: {unused_archetypes}")
-            print(f"  Max usage: {max_usage:.3f}")
-            
-            # Emergency intervention
-            with torch.no_grad():
-                # 1. Re-randomize dead archetypes
-                for i in range(self.model.num_archetypes):
-                    if mean_usage[i] < 0.01:
-                        # Replace with random point from data
-                        random_batch = next(iter(self.train_loader))[0][:1].to(self.device)
-                        h = self.model.encoder_cnn(random_batch)
-                        h = h.view(h.size(0), -1)
-                        # Add noise to create variation
-                        noise = torch.randn(1, self.model.latent_dim, device=self.device) * 0.5
-                        new_archetype = torch.randn_like(self.model.archetypes[i]) * 2.0
-                        self.model.archetypes.data[i] = new_archetype
-                        print(f"    Reset archetype {i}")
-                
-                # 2. Add noise to over-used archetype
-                if max_usage > 0.8:
-                    dominant_idx = torch.argmax(mean_usage)
-                    noise = torch.randn_like(self.model.archetypes[dominant_idx]) * 0.3
-                    self.model.archetypes.data[dominant_idx] += noise
-                    print(f"    Added noise to dominant archetype {dominant_idx}")
-                
-                # 3. Increase separation between archetypes
-                self.orthogonalize_archetypes()
-            
-            # Adjust loss weights
-            self.criterion.diversity_weight = min(0.5, self.criterion.diversity_weight * 1.5)
-            self.criterion.sparsity_weight = max(0.05, self.criterion.sparsity_weight * 0.7)
-            print(f"  Adjusted weights: diversity={self.criterion.diversity_weight:.3f}, "
-                  f"sparsity={self.criterion.sparsity_weight:.3f}")
-            
-            return True
-        
-        return False
-    
-    def orthogonalize_archetypes(self):
-        """Make archetypes more orthogonal to each other."""
-        with torch.no_grad():
-            # Use QR decomposition for orthogonalization
-            if self.model.num_archetypes <= self.model.latent_dim:
-                Q, _ = torch.qr(self.model.archetypes.t())
-                self.model.archetypes.data = Q.t()[:self.model.num_archetypes] * 2.0
-            else:
-                # Gram-Schmidt for more archetypes than dimensions
-                for i in range(1, self.model.num_archetypes):
-                    for j in range(i):
-                        # Remove projection of i onto j
-                        proj = torch.dot(self.model.archetypes[i], self.model.archetypes[j])
-                        proj = proj / (torch.norm(self.model.archetypes[j]) ** 2 + 1e-8)
-                        self.model.archetypes.data[i] -= proj * self.model.archetypes[j]
-                    # Normalize
-                    self.model.archetypes.data[i] = F.normalize(
-                        self.model.archetypes[i], p=2, dim=0
-                    ) * 2.0
-    
-    def initialize_diverse_archetypes(self):
-        """Initialize archetypes with maximum diversity."""
-        print("Initializing diverse archetypes...")
-        
-        # Collect encoded features
-        self.model.eval()
-        features = []
-        
-        with torch.no_grad():
-            for i, (images, labels) in enumerate(self.train_loader):
-                if i >= 10:
-                    break
-                images = images.to(self.device)
-                
-                # Get encoded features
-                h = self.model.encoder_cnn(images)
-                h = h.view(h.size(0), -1)
-                
-                # Simple projection to latent dim
-                proj = nn.Linear(h.size(1), self.model.latent_dim).to(self.device)
-                features.append(proj(h).cpu().numpy())
-        
-        features = np.concatenate(features, axis=0)
-        
-        # Use K-means++ with multiple restarts to find diverse clusters
-        best_inertia = float('inf')
-        best_centers = None
-        
-        for _ in range(5):  # Try 5 times
-            kmeans = KMeans(
-                n_clusters=self.model.num_archetypes, 
-                init='k-means++',
-                n_init=1,
-                max_iter=100
-            )
-            kmeans.fit(features)
-            
-            if kmeans.inertia_ < best_inertia:
-                best_inertia = kmeans.inertia_
-                best_centers = kmeans.cluster_centers_
-        
-        # Set archetypes and ensure they're well-separated
-        self.model.archetypes.data = torch.tensor(
-            best_centers, 
-            dtype=torch.float32,
-            device=self.device
-        ) * 1.5  # Scale up for better separation
-        
-        # Add small random perturbations to ensure uniqueness
-        noise = torch.randn_like(self.model.archetypes) * 0.1
-        self.model.archetypes.data += noise
-        
-        print(f"Initialized {self.model.num_archetypes} diverse archetypes")
 
+    # In DAATrainer.save_checkpoint
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save checkpoint."""
         checkpoint = {
@@ -223,147 +63,216 @@ class DAATrainer:
                 'latent_dim': self.model.latent_dim,
                 'num_archetypes': self.model.num_archetypes
             },
-            'best_val_loss': self.best_val_loss
+
+            'best_val_loss': float(self.best_val_loss) 
         }
         
         if is_best:
             path = os.path.join(self.checkpoint_dir, 'best_model.pth')
             torch.save(checkpoint, path)
-            print(f"  💾 Saved best model (val_loss: {self.best_val_loss:.4f})")
-        
-        if epoch % 20 == 0:
-            path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch:03d}.pth')
-            torch.save(checkpoint, path)
+            print(f"\n💾 Saved best model (val_loss: {self.best_val_loss:.4f})")
     
-    def train(self, num_epochs):
-        """Training with collapse prevention."""
+    # CRITICAL FIX 4: Principled archetype initialization using K-Means
+    def initialize_archetypes_with_kmeans(self):
+        """
+        Run K-Means on latent representations of the data to get good
+        initial positions for the archetypes.
+        """
+        print("Initializing archetypes with K-Means...")
+        self.model.eval()
+        latent_features = []
+        with torch.no_grad():
+            for i, (images, _) in enumerate(self.train_loader):
+                if i > 10: # Use ~10 batches for initialization
+                    break
+                images = images.to(self.device)
+                h = self.model.encoder_cnn(images)
+                h = h.view(h.size(0), -1)
+                
+                # To get to latent space, we need a temporary linear layer
+                # since we don't have the alpha->z part yet.
+                # A simpler way is to just use a random projection for initialization
+                if not hasattr(self, '_init_proj'):
+                   self._init_proj = torch.nn.Linear(h.shape[1], self.model.latent_dim).to(self.device)
+
+                z = self._init_proj(h)
+                latent_features.append(z.cpu().numpy())
         
-        # Better initialization
-        self.initialize_diverse_archetypes()
+        latent_features = np.concatenate(latent_features, axis=0)
         
-        for epoch in range(1, num_epochs + 1):
-            # Training
+        kmeans = KMeans(n_clusters=self.model.num_archetypes, random_state=self.config['seed'], n_init=10)
+        kmeans.fit(latent_features)
+        
+        initial_archetypes = torch.from_numpy(kmeans.cluster_centers_).float().to(self.device)
+        self.model.archetypes.data.copy_(initial_archetypes)
+        print("✅ Archetypes initialized from K-Means centroids.")
+
+
+    def train(self):
+        # Run K-Means initialization before starting training
+        self.initialize_archetypes_with_kmeans()
+        
+        start_time = time.time()
+        for epoch in range(1, self.config['num_epochs'] + 1):
+            # --- Training Step ---
             self.model.train()
-            train_loss = 0
-            
-            for images, _ in self.train_loader:
+            train_losses = []
+            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config['num_epochs']} [Train]")
+            for images, _ in pbar:
                 images = images.to(self.device)
                 
-                recon, alpha, z, logits = self.model(images)
-                loss, loss_dict = self.criterion(recon, images, alpha, z, logits, self.model)
+                recon, alpha, _, _ = self.model(images)
+                loss, loss_dict = self.criterion(recon, images, alpha, self.model)
                 
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 
-                train_loss += loss.item()
-            
-            train_loss /= len(self.train_loader)
-            
-            # Validation
-            val_loss = self.validate()
-            
-            # Check for collapse every 5 epochs
-            if epoch % 5 == 0:
-                collapsed = self.detect_and_fix_collapse(epoch)
-                if collapsed:
-                    # Reset patience if we had to intervene
-                    self.patience_counter = 0
+                train_losses.append(loss.item())
+                pbar.set_postfix(loss=f"{loss.item():.4f}", recon=f"{loss_dict['reconstruction']:.4f}", div=f"{loss_dict['diversity']:.4f}")
 
-            # Update history
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
+            avg_train_loss = np.mean(train_losses)
+            self.history['train_loss'].append(avg_train_loss)
 
-            # Update scheduler
+            # --- Validation Step ---
+            self.model.eval()
+            val_losses = []
+            pbar_val = tqdm(self.val_loader, desc=f"Epoch {epoch}/{self.config['num_epochs']} [Val]")
+            with torch.no_grad():
+                for images, _ in pbar_val:
+                    images = images.to(self.device)
+                    recon, alpha, _, _ = self.model(images)
+                    # We only care about reconstruction loss for validation metric
+                    val_loss = F.mse_loss(recon, images)
+                    val_losses.append(val_loss.item())
+                    pbar_val.set_postfix(recon_loss=f"{val_loss.item():.4f}")
+
+            avg_val_loss = np.mean(val_losses)
+            self.history['val_loss'].append(avg_val_loss)
             self.scheduler.step()
 
-            # Save best
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.best_epoch = epoch
-                self.save_checkpoint(epoch, is_best=True)
-            elif epoch % 20 == 0:
-                self.save_checkpoint(epoch, is_best=False)
+            print(f"Epoch {epoch} Summary: Train Loss: {avg_train_loss:.4f}, Val Recon Loss: {avg_val_loss:.4f}")
             
-            # Logging
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}/{num_epochs}")
-                print(f"  Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-                print(f"  Loss components: {loss_dict}")
-    
-    def validate(self):
-        """Standard validation."""
-        self.model.eval()
-        total_loss = 0
+            # --- Checkpointing ---
+            if avg_val_loss < self.best_val_loss:
+                self.best_val_loss = avg_val_loss
+                self.save_checkpoint(epoch, is_best=True)
         
-        with torch.no_grad():
-            for images, _ in self.val_loader:
-                images = images.to(self.device)
-                recon, _, _, _ = self.model(images)
-                loss = F.mse_loss(recon, images)
-                total_loss += loss.item()
+        end_time = time.time()
+        print(f"\nTraining finished in {(end_time - start_time) / 60:.2f} minutes.")
+        print(f"Best validation loss: {self.best_val_loss:.4f}")
+
+# def main():
+#     config = {
+#         # Model
+#         'latent_dim': 16,  # Can be smaller for this task
+#         'num_archetypes': 7, # Match the number of emotions
+#         'dropout_rate': 0.1,
         
-        return total_loss / len(self.val_loader)
+#         # Training
+#         'batch_size': 32,
+#         'num_epochs': 150,
+#         'lr': 1e-3,
+#         'weight_decay': 1e-5,
+        
+#         # Loss weights 
+#         'reconstruction_weight': 1.0,
+#         'sparsity_weight': 0.05, # Encourages sparse alphas
+#         'diversity_weight': 0.8, # Strongly prevents archetype underuse
+#         'separation_weight': 0.5, # Strongly pushes archetypes apart
+
+#         # Data & Paths
+#         'output_dir': '../models/daa_fixed_7arch',
+#         'data_path': '../data/resized_jaffe',
+#         'val_split_subject_count': 2, # Keep validation set small but representative
+#         'seed': 42
+#     }
     
+#     torch.manual_seed(config['seed'])
+#     np.random.seed(config['seed'])
+    
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     print(f"Using device: {device}")
+    
+#     train_loader, val_loader, _, _ = create_data_loaders(
+#         data_path=config['data_path'],
+#         batch_size=config['batch_size'],
+#         val_split_subject_count=config['val_split_subject_count'],
+#         augment=True, # Augmentation helps robustness
+#         seed=config['seed']
+#     )
+    
+#     model = DeepAA(
+#         latent_dim=config['latent_dim'],
+#         num_archetypes=config['num_archetypes'],
+#         dropout_rate=config['dropout_rate']
+#     )
+    
+#     trainer = DAATrainer(
+#         model=model,
+#         train_loader=train_loader,
+#         val_loader=val_loader,
+#         device=device,
+#         config=config
+#     )
+    
+#     trainer.train()
+
 def main():
-    """Run the fixed training."""
-    
-    # FIXED configuration
+    # --- CHANGED: New configuration for MNIST task ---
+    target_digit = 8
     config = {
+        # Task
+        'target_digit': target_digit, # We will find archetypes for the digit '2'
+        'num_archetypes': 3, # Let's search for 3 primary styles of '2'
+
         # Model
-        'latent_dim': 32, 
-        'num_archetypes': 3,  
+        'latent_dim': 16,
         'dropout_rate': 0.05,
         
         # Training
-        'batch_size': 8,
-        'num_epochs': 200,
-        'lr': 2e-3,
-        'weight_decay': 1e-6,
+        'batch_size': 128, # Can use a larger batch size with MNIST
+        'num_epochs': 100, # MNIST trains faster, so fewer epochs needed
+        'lr': 1e-3,
+        'weight_decay': 1e-5,
         
-        # Loss weights 
+        # Loss weights
         'reconstruction_weight': 1.0,
-        'sparsity_weight': 0.08,
-        'push_away_weight': 0.1,
-        'entropy_weight': 0.005,
-        'commitment_weight': 0.01,
+        'sparsity_weight': 0.1,
+        'diversity_weight': 1.0, # Emphasize diversity
+        'separation_weight': 0.4, # Emphasize separation
 
-        # Paths
-        'output_dir': '../models/daa_fixed',
-        'data_path': '../data/resized_jaffe',
-        'val_split_subject_count': 3,
-        'seed': 342
+        # Data & Paths
+        'output_dir': f"../models/daa_mnist_digit_{target_digit}",
+        'data_path': '../data/mnist',
+        'seed': 42
     }
     
-    # Set seeds
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     
-    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Data
-    train_loader, val_loader, _, _ = create_data_loaders(
-        data_path=config['data_path'],
+    # --- CHANGED: Use the MNIST data loader ---
+    print(f"Loading MNIST data for digit '{config['target_digit']}'...")
+    train_loader, val_loader = create_mnist_dataloaders(
+        target_digit=config['target_digit'],
         batch_size=config['batch_size'],
-        val_split_subject_count=config['val_split_subject_count'],
-        augment=False,
+        data_path=config['data_path'],
         seed=config['seed']
     )
     
-    # Create FIXED model
+    # --- CHANGED: Instantiate model with MNIST-specific config ---
     model = DeepAA(
         input_channels=1,
-        input_size=128,
+        input_size=32, # Must match the data loader's resize
         latent_dim=config['latent_dim'],
         num_archetypes=config['num_archetypes'],
-        dropout_rate=config['dropout_rate'],
-        # temperature=1.0  # Start warm
+        dropout_rate=config['dropout_rate']
     )
     
-    # Create trainer
     trainer = DAATrainer(
         model=model,
         train_loader=train_loader,
@@ -372,11 +281,8 @@ def main():
         config=config
     )
     
-    # Train
-    trainer.train(num_epochs=config['num_epochs'])
-    
-    return trainer, model
+    trainer.train()
 
 
 if __name__ == "__main__":
-    trainer, model = main()
+    main()
