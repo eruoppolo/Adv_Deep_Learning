@@ -13,6 +13,7 @@ torch_env/
 # Python cache
 __pycache__/
 *.pyc
+.*
 
 # IDE and editor specific files
 .vscode/
